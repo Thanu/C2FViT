@@ -9,6 +9,9 @@ import torch.nn.functional as F
 import torch.utils.data as Data
 from C2FViT_model import C2F_ViT_stage, AffineCOMTransform, Center_of_mass_initial_pairwise, multi_resolution_NCC
 from Functions import Dataset_epoch
+import torchvision.transforms as T
+from torch.utils.data import Dataset
+import nrrd
 
 
 def dice(im1, atlas):
@@ -24,10 +27,75 @@ def dice(im1, atlas):
         num_count += 1
     return dice / num_count
 
+class Normalize(object):
+    """Normalize a tensor image with mean and standard deviation.
+    Given mean: ``(M1,...,Mn)`` and std: ``(S1,..,Sn)`` for ``n`` channels, this transform
+    will normalize each channel of the input ``torch.*Tensor`` i.e.
+    ``output[channel] = (input[channel] - mean[channel]) / std[channel]``
+    .. note::
+        This transform acts out of place, i.e., it does not mutate the input tensor.
+    Args:
+        mean (sequence): Sequence of means for each channel.
+        std (sequence): Sequence of standard deviations for each channel.
+        inplace(bool,optional): Bool to make this operation in-place.
+    """
 
+    def __init__(self, inplace=False):
+        self.inplace = inplace
+
+    def __call__(self, tensor):
+        """
+        Args:
+            tensor (Tensor): Tensor image of size (C, H, W) to be normalized.
+        Returns:
+            Tensor: Normalized Tensor image.
+        """
+        return F.normalize(tensor.float())
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(mean={0}, std={1})'.format(1, 2)
+    
+
+class C2FVITDataset(Dataset):
+    def __init__(self, f_dir, m_dir, dtype, test_dataset=False):
+        self.f_dir = f_dir
+        self.m_dir = m_dir
+        self.dtype = dtype
+        self.f_images =sorted(os.listdir(self.f_dir))
+        self.m_images = sorted(os.listdir(self.m_dir))
+        self.test_dataset = test_dataset
+        self.transform =T.Compose([
+                      Normalize(),
+                    ])
+
+        self.test_dataset_header = []
+        
+    def __len__(self):
+        return len(self.f_images)
+
+    def __getitem__(self, idx):
+        f_path = os.path.join(self.f_dir, self.f_images[idx])
+        f_image, f_header = nrrd.read(f_path)
+        m_path = os.path.join(self.m_dir, self.m_images[idx])
+        m_image, m_header = nrrd.read(m_path)
+        if self.test_dataset:
+           self.test_dataset_header.append(m_header) 
+        
+        if self.transform:
+            f_image = self.transform(torch.from_numpy(f_image).type(self.dtype).unsqueeze(0))
+            m_image = self.transform(torch.from_numpy(m_image).type(self.dtype).unsqueeze(0))
+
+        input = [m_image,f_image]
+        zero_phi = np.zeros(m_image.shape)
+        output = [f_image, zero_phi]
+        return input, output
+    
+    def getTestDatasetHeader(self):
+        return self.test_dataset_header
+    
 def train():
     print("Training C2FViT...")
-    model = C2F_ViT_stage(img_size=128, patch_size=[3, 7, 15], stride=[2, 4, 8], num_classes=12,
+    model = C2F_ViT_stage(img_size=64, patch_size=[3, 7, 15], stride=[2, 4, 8], num_classes=12,
                           embed_dims=[256, 256, 256],
                           num_heads=[2, 2, 2], mlp_ratios=[2, 2, 2], qkv_bias=False, qk_scale=None, drop_rate=0.,
                           attn_drop_rate=0., norm_layer=nn.Identity,
@@ -50,9 +118,10 @@ def train():
 
     loss_similarity = multi_resolution_NCC(win=7, scale=3)
 
-    # OASIS
-    imgs = sorted(glob.glob(datapath + "/OASIS_OAS1_*_MR1/norm.nii.gz"))
-    labels = sorted(glob.glob(datapath + "/OASIS_OAS1_*_MR1/seg35.nii.gz"))
+    f_img_dir = '/media/thanuja/ualberta/thanuja/dataset/patient_data/ML_data/3d_echo_patient_data_resized_64_v3/test/fixed/'
+    m_img_dir = '/media/thanuja/ualberta/thanuja/dataset/patient_data/ML_data/3d_echo_patient_data_resized_64_v3/test/moving/'
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    dtype = torch.float32
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
@@ -63,7 +132,9 @@ def train():
 
     lossall = np.zeros((2, iteration + 1))
 
-    training_generator = Data.DataLoader(Dataset_epoch(imgs, labels, norm=True, use_label=False),
+    training_generator = Data.DataLoader(
+        C2FVITDataset(f_img_dir, m_img_dir, dtype),
+        # Dataset_epoch(fixed_imgs, moving_imgs, fixed_labels, moving_labels, norm=True, use_label=False),
                                          batch_size=1,
                                          shuffle=True, num_workers=4)
     step = 0
@@ -71,7 +142,7 @@ def train():
     if load_model is True:
         model_path = "../Model/LDR_LPBA_NCC_lap_share_preact_1_05_3000.pth"
         print("Loading weight: ", model_path)
-        step = 3000
+        step = 50
         model.load_state_dict(torch.load(model_path))
         temp_lossall = np.load("../Model/loss_LDR_LPBA_NCC_lap_share_preact_1_05_3000.npy")
         lossall[:, 0:3000] = temp_lossall[:, 0:3000]
@@ -79,8 +150,8 @@ def train():
     while step <= iteration:
         for X, Y in training_generator:
 
-            X = X.cuda().float()
-            Y = Y.cuda().float()
+            X = X[0].to(device)
+            Y = Y[0].to(device)
 
             # COM initialization
             if com_initial:
@@ -179,19 +250,19 @@ if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument("--modelname", type=str,
                         dest="modelname",
-                        default='C2FViT_affine_COM_pairwise_',
+                        default='C2FViT_rigid_COM_pairwise_',
                         help="Model name")
     parser.add_argument("--lr", type=float,
                         dest="lr", default=1e-4, help="learning rate")
     parser.add_argument("--iteration", type=int,
-                        dest="iteration", default=160001,
+                        dest="iteration", default=1000,
                         help="number of total iterations")
     parser.add_argument("--checkpoint", type=int,
                         dest="checkpoint", default=1000,
                         help="frequency of saving models")
     parser.add_argument("--datapath", type=str,
                         dest="datapath",
-                        default='/PATH/TO/YOUR/DATA',
+                        default='/media/thanuja/ualberta/thanuja/dataset/patient_data/ML_data/3d_echo_patient_data_resized_64_v3',
                         help="data path for training images")
     parser.add_argument("--com_initial", type=bool,
                         dest="com_initial", default=True,
